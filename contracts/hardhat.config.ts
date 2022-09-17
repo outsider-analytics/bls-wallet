@@ -22,6 +22,13 @@ task("accounts", "Prints the list of accounts", async (_taskArgs, hre) => {
   }
 });
 
+task("generateMnemonic", "Generates and displays a random mnemonic").setAction(
+  async (_params, hre) => {
+    const wallet = hre.ethers.Wallet.createRandom();
+    console.log(wallet.mnemonic.phrase);
+  },
+);
+
 // Don't run this unless you really need to...
 task("privateKeys", "Prints the private keys for accounts")
   .addParam("force", "Whether the command should be run", false, types.boolean)

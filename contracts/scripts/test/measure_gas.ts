@@ -16,7 +16,7 @@ async function main() {
 }
 
 async function logGasForTransfers() {
-  const transferCounts = [31];
+  const transferCounts = [241, 242, 243, 244, 245, 246, 247, 248, 249, 250];
   console.log("Batch transfers for: ", transferCounts);
   for (let i = 0; i < transferCounts.length; i++) {
     const transferCount = transferCounts[i];
@@ -111,7 +111,11 @@ async function logGasForTransfers() {
       const receipt = await response.wait();
 
       // Store gas results to file if testing on Arbitrum network
-      if (network.name === "arbitrum_testnet") {
+      const shouldSaveResults = [
+        "arbitrum_testnet",
+        "arbitrum_testnet_goerli",
+      ].includes(network.name);
+      if (shouldSaveResults) {
         console.log("Sending normal token transfer...");
         const normalResponse = await th.testToken
           .connect(th.fx.signers[0])
@@ -119,6 +123,7 @@ async function logGasForTransfers() {
         const normalTransferReceipt = await normalResponse.wait();
 
         await processGasResultsToFile(
+          fx.provider,
           receipt.transactionHash,
           normalTransferReceipt.transactionHash,
           transferCount,
