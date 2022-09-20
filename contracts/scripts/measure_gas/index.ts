@@ -32,6 +32,7 @@ type GasMeasurement = Readonly<{
     type: TransactionType;
     mode: TransactionMode;
     hash: string;
+    sizeBytes: number;
   };
   gas: {
     used: number;
@@ -209,9 +210,23 @@ const getArbitrumMeasurements = async (
   return { gasUsedForL1: BigNumber.from(gasUsedForL1).toNumber() };
 };
 
+const getTransactionSizeBytes = (txnData: string): number => {
+  /**
+   * txn.data is a DataHexstring (https://docs.ethers.io/v5/api/utils/bytes/#DataHexString)
+   * so can assume if will be even in length.
+   *
+   * One hex character = 4 bits (nibble)
+   * so every 2 will be 1 byte.
+   */
+  const hexIdentifierLen = 2; // 0x
+  const hexCharPerByte = 2;
+  return (txnData.length - hexIdentifierLen) / hexCharPerByte;
+};
+
 const getMeasurements = async (
   { numTransactions, web3Provider }: GasMeasurementContext,
   { mode, type }: GasMeasurementTransactionConfig,
+  txn: ContractTransaction,
   receipt: ContractReceipt,
 ): Promise<GasMeasurement> => {
   const arbitrum = await getArbitrumMeasurements(
@@ -225,6 +240,7 @@ const getMeasurements = async (
       mode,
       type,
       hash: receipt.transactionHash,
+      sizeBytes: getTransactionSizeBytes(txn.data),
     },
     gas: {
       used: receipt.gasUsed.toNumber(),
@@ -262,7 +278,7 @@ const measureGas = async (cfg: GasMeasurementConfig): Promise<void> => {
       const txn = await txnCfg.factoryFunc(ctx);
       const receipt = await txn.wait();
 
-      const m = await getMeasurements(ctx, txnCfg, receipt);
+      const m = await getMeasurements(ctx, txnCfg, txn, receipt);
       const measurement = txnCfg.postMeasurementFunc
         ? await txnCfg.postMeasurementFunc(m)
         : m;
