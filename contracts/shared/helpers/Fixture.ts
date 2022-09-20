@@ -147,9 +147,10 @@ export default class Fixture {
    * @returns array of wallets
    */
   async createBLSWallets(): Promise<BlsWalletWrapper[]> {
-    return await Promise.all(
-      this.lazyBlsWallets.map((lazyWallet) => lazyWallet()),
-    );
+    return this.lazyBlsWallets.reduce(async (prev, lazyWallet) => {
+      const wallets = await prev;
+      return [...wallets, await lazyWallet()];
+    }, Promise.resolve([]));
   }
 
   bundleFrom(
