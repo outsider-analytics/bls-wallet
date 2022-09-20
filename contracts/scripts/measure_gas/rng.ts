@@ -7,8 +7,12 @@ export class Rng {
     this.randFunc = alea(seed);
   }
 
-  int(min: number = 0, max: number = 1) {
-    return Math.floor(this.randFunc() * max) + min;
+  random(): number {
+    return this.randFunc();
+  }
+
+  int(min: number = 0, max: number = 1): number {
+    return Math.floor(this.random() * max) + min;
   }
 
   item<T>(arr: T[]): T {

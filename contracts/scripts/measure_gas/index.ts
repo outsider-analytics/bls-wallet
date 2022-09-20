@@ -1,11 +1,18 @@
 /**
- * yarn hardhat run ./scripts/measure_gas --network gethDev
+ * yarn hardhat run ./scripts/measure_gas --network network_from_hardhat_config
  */
 
 /* eslint-disable no-process-exit */
-import { BigNumber, ContractTransaction, ContractReceipt } from "ethers";
+import {
+  BigNumber,
+  BigNumberish,
+  ContractTransaction,
+  ContractReceipt,
+} from "ethers";
 // import { solidityPack } from "ethers/lib/utils";
-// import { network } from "hardhat";
+import { network } from "hardhat";
+import { HttpNetworkConfig } from "hardhat/types";
+import Web3 from "web3";
 import { BlsWalletWrapper } from "../../clients/src";
 import Fixture from "../../shared/helpers/Fixture";
 import TokenHelper from "../../shared/helpers/TokenHelper";
@@ -15,6 +22,10 @@ import { Rng } from "./rng";
 type TransactionType = "transfer";
 type TransactionMode = "normal" | "bls" | "blsExpander";
 
+type ArbitrumGasMeasurement = {
+  gasUsedForL1: number;
+};
+
 type GasMeasurement = Readonly<{
   numTransactions: number;
   transaction: {
@@ -22,10 +33,10 @@ type GasMeasurement = Readonly<{
     mode: TransactionMode;
     hash: string;
   };
-  // TODO Split this into L1 & l2?
   gas: {
     used: number;
     price: number;
+    arbitrum?: ArbitrumGasMeasurement;
   };
 }>;
 
@@ -34,16 +45,14 @@ type GasMeasurementContext = Readonly<{
   rng: Rng;
   blsWallets: BlsWalletWrapper[];
   numTransactions: number;
+  web3Provider: Web3;
 }>;
 
 type GasMeasurementTransactionConfig = Readonly<{
   mode: TransactionMode;
   type: TransactionType;
   factoryFunc: (ctx: GasMeasurementContext) => Promise<ContractTransaction>;
-  postMeasurementFunc?: (
-    ctx: GasMeasurementContext,
-    measurement: GasMeasurement,
-  ) => GasMeasurement;
+  postMeasurementFunc?: (measurement: GasMeasurement) => GasMeasurement;
 }>;
 
 type GasMeasurementConfig = Readonly<{
@@ -133,12 +142,23 @@ const createNormalTransfer = (
 //   );
 // };
 
-const postNormalTransfer = (
-  ctx: GasMeasurementContext,
-  measurement: GasMeasurement,
-): GasMeasurement => {
-  // TODO multiple by transfer count
-  return measurement;
+const postNormalTransfer = (measurement: GasMeasurement): GasMeasurement => {
+  const arbitrum = measurement.gas.arbitrum
+    ? {
+        ...measurement.gas.arbitrum,
+        gasUsedForL1:
+          measurement.gas.arbitrum.gasUsedForL1 * measurement.numTransactions,
+      }
+    : undefined;
+
+  return {
+    ...measurement,
+    gas: {
+      ...measurement.gas,
+      used: measurement.gas.used * measurement.numTransactions,
+      arbitrum,
+    },
+  };
 };
 
 const createContext = async (
@@ -146,23 +166,59 @@ const createContext = async (
   numTransactions: number,
 ): Promise<GasMeasurementContext> => {
   const rng = new Rng(cfg.seed);
-  const fx = await Fixture.create(cfg.numBlsWallets);
+  const generateSecret = () => Math.abs((rng.random() * 0xffffffff) << 0);
+  const secretNumbers = Array.from(
+    { length: cfg.numBlsWallets },
+    generateSecret,
+  );
+
+  const fx = await Fixture.create(secretNumbers.length, secretNumbers);
   const th = new TokenHelper(fx);
   const blsWallets = await th.walletTokenSetup();
+
+  /**
+   * Web3 needs to be used over ethers.js since its transaction
+   * receipts do not have the 'gasUsedForL1' property stripped out.
+   */
+  const rpcUrl = (network.config as HttpNetworkConfig).url;
+  if (!rpcUrl) {
+    throw new Error("ethers.js network config does not have url");
+  }
+  const web3Provider = new Web3(rpcUrl);
 
   return {
     th,
     rng,
     blsWallets,
     numTransactions,
+    web3Provider,
   };
 };
 
-const getMeasurements = (
+const getArbitrumMeasurements = async (
+  web3Provider: Web3,
+  txnHash: string,
+): Promise<ArbitrumGasMeasurement | undefined> => {
+  const web3Receipt = await web3Provider.eth.getTransactionReceipt(txnHash);
+  const { gasUsedForL1 } = web3Receipt as unknown as {
+    gasUsedForL1?: BigNumberish;
+  };
+  if (!gasUsedForL1) {
+    return undefined;
+  }
+  return { gasUsedForL1: BigNumber.from(gasUsedForL1).toNumber() };
+};
+
+const getMeasurements = async (
+  { numTransactions, web3Provider }: GasMeasurementContext,
   { mode, type }: GasMeasurementTransactionConfig,
-  numTransactions: number,
   receipt: ContractReceipt,
-): GasMeasurement => {
+): Promise<GasMeasurement> => {
+  const arbitrum = await getArbitrumMeasurements(
+    web3Provider,
+    receipt.transactionHash,
+  );
+
   return {
     numTransactions,
     transaction: {
@@ -173,6 +229,7 @@ const getMeasurements = (
     gas: {
       used: receipt.gasUsed.toNumber(),
       price: receipt.effectiveGasPrice.toNumber(),
+      arbitrum,
     },
   };
 };
@@ -204,12 +261,10 @@ const measureGas = async (cfg: GasMeasurementConfig): Promise<void> => {
 
       const txn = await txnCfg.factoryFunc(ctx);
       const receipt = await txn.wait();
-      console.warn("???????");
-      console.warn(receipt);
 
-      const m = getMeasurements(txnCfg, numTxns, receipt);
+      const m = await getMeasurements(ctx, txnCfg, receipt);
       const measurement = txnCfg.postMeasurementFunc
-        ? await txnCfg.postMeasurementFunc(ctx, m)
+        ? await txnCfg.postMeasurementFunc(m)
         : m;
       console.warn("!!!!!!!!!!!");
       console.warn(measurement);
@@ -249,10 +304,10 @@ async function main() {
    * - (?) address book trasnfer
    */
   const config: GasMeasurementConfig = {
-    seed: "abc123",
+    seed: "bls_wallet_measure_gas",
     numBlsWallets: 8,
     // transactionBatches: [1, 10, 30, 241 /* max */],
-    transactionBatches: [1, 10],
+    transactionBatches: [2],
     transactionConfigs: [
       {
         type: "transfer",
