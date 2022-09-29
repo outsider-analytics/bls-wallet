@@ -1,19 +1,19 @@
+/* eslint-disable no-process-exit */
 /**
  * yarn hardhat run ./scripts/measure_gas --network network_from_hardhat_config
  */
 
-/* eslint-disable no-process-exit */
 import {
   BigNumber,
   BigNumberish,
   ContractTransaction,
   ContractReceipt,
 } from "ethers";
-// import { solidityPack } from "ethers/lib/utils";
+import { solidityPack } from "ethers/lib/utils";
 import { network } from "hardhat";
 import { HttpNetworkConfig } from "hardhat/types";
 import Web3 from "web3";
-import { BlsWalletWrapper } from "../../clients/src";
+import { BlsWalletWrapper, Bundle } from "../../clients/src";
 import Fixture from "../../shared/helpers/Fixture";
 import TokenHelper from "../../shared/helpers/TokenHelper";
 // import { processGasResultsToFile } from "./format";
@@ -41,13 +41,24 @@ type GasMeasurement = Readonly<{
   };
 }>;
 
+type GasMeasurementError = Readonly<{
+  numTransactions: number;
+  transaction: {
+    type: TransactionType;
+    mode: TransactionMode;
+  };
+  error: Error;
+}>;
+
 type GasMeasurementContext = Readonly<{
+  fx: Fixture;
   th: TokenHelper;
   rng: Rng;
   blsWallets: BlsWalletWrapper[];
   numTransactions: number;
   web3Provider: Web3;
 }>;
+type InitialContext = Omit<GasMeasurementContext, "numTransactions">;
 
 type GasMeasurementTransactionConfig = Readonly<{
   mode: TransactionMode;
@@ -70,78 +81,12 @@ const getTransferAmount = (ctx: GasMeasurementContext): BigNumber => {
 const createNormalTransfer = (
   ctx: GasMeasurementContext,
 ): Promise<ContractTransaction> => {
-  const signer = ctx.th.fx.signers[0];
+  const signer = ctx.fx.signers[0];
   const toAddress = ctx.rng.item(ctx.blsWallets).address;
   const amount = getTransferAmount(ctx);
 
   return ctx.th.testToken.connect(signer).transfer(toAddress, amount);
 };
-
-// const createBlsTransfers = (
-//   ctx: GasMeasurementContext,
-// ): Promise<ContractTransaction> => {
-//   throw new Error("TODO implement");
-//   const actionsArr = [];
-//   const encodedFunctions = [];
-//   const testAddress = "0x" + (1).toString(16).padStart(40, "0");
-
-//   for (let i = 0; i < transferCount; i++) {
-//     encodedFunctions.push(
-//       th.testToken.interface.encodeFunctionData("transfer", [
-//         testAddress,
-//         testAmount,
-//       ]),
-//     );
-
-//     actionsArr.push({
-//       ethValue: BigNumber.from(0),
-//       contractAddress: th.testToken.address,
-//       encodedFunction: encodedFunctions[i],
-//     });
-//   }
-
-//   const operation = {
-//     nonce: BigNumber.from(nonce),
-//     actions: actionsArr,
-//   };
-//   const tx = blsWallets[0].sign(operation);
-
-//   const aggTx = fx.blsWalletSigner.aggregate([tx]);
-//   console.log("Done signing & aggregating.");
-
-//   const encodedFunction = solidityPack(
-//     ["bytes"],
-//     [tx.operations[0].actions[0].encodedFunction],
-//   );
-
-//   const methodId = encodedFunction.slice(0, 10);
-//   const encodedParamSets = encodedFunctions.map(
-//     (encFunction) => `0x${encFunction.slice(10)}`,
-//   );
-
-//   const publicKey = fx.blsWalletSigner.getPublicKey(blsWallets[0].privateKey);
-
-//   console.log("Estimating...", fx.blsExpander.address);
-//   const gasEstimate =
-//     await fx.blsExpander.estimateGas.blsCallMultiSameCallerContractFunction(
-//       publicKey,
-//       nonce,
-//       aggTx.signature,
-//       th.testToken.address,
-//       methodId,
-//       encodedParamSets,
-//     );
-
-//   console.log("Sending Agg Tx...");
-//   const response = await fx.blsExpander.blsCallMultiSameCallerContractFunction(
-//     publicKey,
-//     nonce,
-//     aggTx.signature,
-//     th.testToken.address,
-//     methodId,
-//     encodedParamSets,
-//   );
-// };
 
 const postNormalTransfer = (measurement: GasMeasurement): GasMeasurement => {
   const arbitrum = measurement.gas.arbitrum
@@ -154,6 +99,11 @@ const postNormalTransfer = (measurement: GasMeasurement): GasMeasurement => {
 
   return {
     ...measurement,
+    transaction: {
+      ...measurement.transaction,
+      sizeBytes:
+        measurement.transaction.sizeBytes * measurement.numTransactions,
+    },
     gas: {
       ...measurement.gas,
       used: measurement.gas.used * measurement.numTransactions,
@@ -162,10 +112,99 @@ const postNormalTransfer = (measurement: GasMeasurement): GasMeasurement => {
   };
 };
 
-const createContext = async (
-  cfg: GasMeasurementConfig,
-  numTransactions: number,
-): Promise<GasMeasurementContext> => {
+const createBlsTransfers = async (
+  ctx: GasMeasurementContext,
+): Promise<ContractTransaction> => {
+  const signer = ctx.fx.signers[0];
+
+  const bundles: Bundle[] = [];
+  const walletNonces = await Promise.all(
+    ctx.blsWallets.map(async (w) => {
+      const n = await w.Nonce();
+      return n.toNumber();
+    }),
+  );
+
+  for (let i = 0; i < ctx.numTransactions; i++) {
+    const walletIdx = ctx.rng.int(0, ctx.blsWallets.length);
+    const blsWallet = ctx.blsWallets[walletIdx];
+
+    const toAddress = ctx.rng.item(ctx.blsWallets, [blsWallet]).address;
+    const amount = getTransferAmount(ctx);
+
+    const nonce = walletNonces[walletIdx]++;
+    const bundle = blsWallet.sign({
+      nonce,
+      actions: [
+        {
+          contractAddress: ctx.th.testToken.address,
+          encodedFunction: ctx.th.testToken.interface.encodeFunctionData(
+            "transfer",
+            [toAddress, amount],
+          ),
+          ethValue: 0,
+        },
+      ],
+    });
+
+    bundles.push(bundle);
+  }
+
+  const aggBundle = ctx.fx.blsWalletSigner.aggregate(bundles);
+
+  return ctx.fx.verificationGateway.connect(signer).processBundle(aggBundle);
+};
+
+const createBlsExpanderTransfers = async (
+  ctx: GasMeasurementContext,
+): Promise<ContractTransaction> => {
+  const signer = ctx.fx.signers[0];
+  const sendingWallet = ctx.rng.item(ctx.blsWallets);
+
+  const actions = [];
+
+  for (let i = 0; i < ctx.numTransactions; i++) {
+    const toAddress = ctx.rng.item(ctx.blsWallets, [sendingWallet]).address;
+    const amount = getTransferAmount(ctx);
+
+    actions.push({
+      ethValue: 0,
+      contractAddress: ctx.th.testToken.address,
+      encodedFunction: ctx.th.testToken.interface.encodeFunctionData(
+        "transfer",
+        [toAddress, amount],
+      ),
+    });
+  }
+
+  const operation = {
+    nonce: await sendingWallet.Nonce(),
+    actions,
+  };
+  const bundle = sendingWallet.sign(operation);
+
+  const encodedFunction = solidityPack(
+    ["bytes"],
+    [operation.actions[0].encodedFunction],
+  );
+  const methodId = encodedFunction.slice(0, 10);
+  const encodedParamSets = operation.actions.map(
+    (a) => `0x${a.encodedFunction.slice(10)}`,
+  );
+
+  return ctx.fx.blsExpander
+    .connect(signer)
+    .blsCallMultiSameCallerContractFunction(
+      sendingWallet.PublicKey(),
+      operation.nonce,
+      bundle.signature,
+      ctx.th.testToken.address,
+      methodId,
+      encodedParamSets,
+    );
+};
+
+const init = async (cfg: GasMeasurementConfig): Promise<InitialContext> => {
   const rng = new Rng(cfg.seed);
   const generateSecret = () => Math.abs((rng.random() * 0xffffffff) << 0);
   const secretNumbers = Array.from(
@@ -188,10 +227,10 @@ const createContext = async (
   const web3Provider = new Web3(rpcUrl);
 
   return {
+    fx,
     th,
     rng,
     blsWallets,
-    numTransactions,
     web3Provider,
   };
 };
@@ -259,13 +298,17 @@ const measureGas = async (cfg: GasMeasurementConfig): Promise<void> => {
 
   console.log();
   const transactionTypes = cfg.transactionConfigs
-    .map((tc) => tc.type)
+    .map((tc) => `${tc.mode}:${tc.type}`)
     .join(", ");
-  console.log(`transaction types: ${transactionTypes}`);
+  console.log(`transaction modes & types: ${transactionTypes}`);
   console.log(`transactions per batch: ${cfg.transactionBatches.join(", ")}`);
   console.log(`# of bls wallets: ${cfg.numBlsWallets}`);
   console.log(`seed: ${cfg.seed}`);
   console.log();
+
+  const initCtx = await init(cfg);
+
+  const measurements: Array<GasMeasurement | GasMeasurementError> = [];
 
   for (const txnCfg of cfg.transactionConfigs) {
     for (const numTxns of cfg.transactionBatches) {
@@ -273,19 +316,41 @@ const measureGas = async (cfg: GasMeasurementConfig): Promise<void> => {
         `running ${txnCfg.type}, mode ${txnCfg.mode}. # of transactions: ${numTxns}`,
       );
 
-      const ctx = await createContext(cfg, numTxns);
+      const ctx = { ...initCtx, numTransactions: numTxns };
 
-      const txn = await txnCfg.factoryFunc(ctx);
-      const receipt = await txn.wait();
+      try {
+        const txn = await txnCfg.factoryFunc(ctx);
+        console.log(`txn hash: ${txn.hash}`);
+        const receipt = await txn.wait();
+        console.log("transaction complete");
 
-      const m = await getMeasurements(ctx, txnCfg, txn, receipt);
-      const measurement = txnCfg.postMeasurementFunc
-        ? await txnCfg.postMeasurementFunc(m)
-        : m;
-      console.warn("!!!!!!!!!!!");
-      console.warn(measurement);
+        const m = await getMeasurements(ctx, txnCfg, txn, receipt);
+        const measurement = txnCfg.postMeasurementFunc
+          ? await txnCfg.postMeasurementFunc(m)
+          : m;
+        measurements.push(measurement);
+        console.log("measurement complete");
+      } catch (err) {
+        console.error(err);
+
+        measurements.push({
+          numTransactions: numTxns,
+          transaction: {
+            type: txnCfg.type,
+            mode: txnCfg.mode,
+          },
+          error: err,
+        });
+
+        continue;
+      }
     }
   }
+
+  console.log("all gas measuements complete");
+
+  // TODO consider removing
+  console.warn(`gas measurements: ${JSON.stringify(measurements, null, 4)}`);
 
   // TODO Write to MD file
   // Store gas results to file if testing on Arbitrum network
@@ -296,7 +361,7 @@ const measureGas = async (cfg: GasMeasurementConfig): Promise<void> => {
   // if (shouldSaveResults) {
   //   console.log("Sending normal token transfer...");
   //   const normalResponse = await th.testToken
-  //     .connect(th.fx.signers[0])
+  //     .connect(fx.signers[0])
   //     .transfer(testAddress, testAmount);
   //   const normalTransferReceipt = await normalResponse.wait();
 
@@ -315,21 +380,29 @@ const measureGas = async (cfg: GasMeasurementConfig): Promise<void> => {
 async function main() {
   /**
    * TODO Test cases for:
-   * - normal transfer
-   * - BLS Wallet bundle transfer
    * - (?) address book trasnfer
    */
   const config: GasMeasurementConfig = {
     seed: "bls_wallet_measure_gas",
-    numBlsWallets: 8,
-    // transactionBatches: [1, 10, 30, 241 /* max */],
-    transactionBatches: [2],
+    numBlsWallets: 16,
+    // Max tested limited on goerli arbitrum is 151 bls transfers.
+    transactionBatches: [1, 2, 10, 20, 50, 100, 150],
     transactionConfigs: [
       {
         type: "transfer",
         mode: "normal",
         factoryFunc: createNormalTransfer,
         postMeasurementFunc: postNormalTransfer,
+      },
+      {
+        type: "transfer",
+        mode: "bls",
+        factoryFunc: createBlsTransfers,
+      },
+      {
+        type: "transfer",
+        mode: "blsExpander",
+        factoryFunc: createBlsExpanderTransfers,
       },
     ],
   };

@@ -15,7 +15,17 @@ export class Rng {
     return Math.floor(this.random() * max) + min;
   }
 
-  item<T>(arr: T[]): T {
-    return arr[this.int(0, arr.length)];
+  item<T>(arr: T[], exclude?: T[]): T {
+    const getRandItem = () => arr[this.int(0, arr.length)];
+
+    if (exclude) {
+      let val = getRandItem();
+      while (exclude.includes(val)) {
+        val = getRandItem();
+      }
+      return val;
+    }
+
+    return getRandItem();
   }
 }
